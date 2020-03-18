@@ -38,8 +38,8 @@ All actions are taken as root.
 3. reboot
 
 4. ssh-keygen to generate ssh keys
-    copy Vagrantfile and insert the private ssh key where indicated
-    vagrant up to start the VMs (will take 5-10 minutes)
+   copy Vagrantfile and insert the private ssh key where indicated (line 36)
+   vagrant up to start the VMs (will take 5-10 minutes)
 
 5. install tools: cfssljson and kubectl
     cfssljson is a tool authored by Cloudflare that helps to generate certificates and kubectl is part of k8s and will be used to generate config files 
@@ -56,9 +56,7 @@ All actions are taken as root.
     curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl
     chmod +x kubectl
     mv kubectl /usr/local/bin
-```
-    
-    
+```  
     
 6. update /etc/hosts file with 
 
