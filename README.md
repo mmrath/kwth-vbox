@@ -30,7 +30,7 @@ and
 
 We will use vagrant to automate the setup of the VirtualBox VMs.
 
-## Step1: Prepare the Host and VMs
+## Step 1: Prepare the Host and VMs
 
 All actions are taken as root.
 - apt-get update && apt-get upgrade
@@ -568,7 +568,7 @@ cfssl gencert \
   -profile=kubernetes \
   admin-csr.json | cfssljson -bare admin
 ```
-- On the host::  generate the config file
+- On the host: generate the config file
 ```
 kubectl config set-cluster kubernetes-the-hard-way \
     --certificate-authority=ca.pem \
@@ -608,5 +608,453 @@ etcd-0               Healthy   {"health":"true"}
 etcd-2               Healthy   {"health":"true"}
 etcd-1               Healthy   {"health":"true"}
 ```
+- On cp0: Generate RBAC role for access
+```
+cat <<EOF > rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  annotations:
+    rbac.authorization.kubernetes.io/autoupdate: "true"
+  labels:
+    kubernetes.io/bootstrapping: rbac-defaults
+  name: system:kube-apiserver-to-kubelet
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/proxy
+      - nodes/stats
+      - nodes/log
+      - nodes/spec
+      - nodes/metrics
+    verbs:
+      - "*"
+EOF
+
+cat <<EOF | kubectl apply --kubeconfig admin.kubeconfig -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:kube-apiserver
+  namespace: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-apiserver-to-kubelet
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: kubernetes
+EOF
+kubectl apply -f rbac.yaml
+```
+
+## Step 4: Setting up processing nodes
+In k8s user applications run on processing nodes are where the applications run. K8s clusters can have 100s of processing nodes. Our example will have 3 nodes: node0, node1 and node2.
+
+The k8s applications kubelet and kube-proxy are installed on all processing nodes and are responsible for their basic management and networking. They authenticate to the API server through client certificates.
+
+POD_CIDR is the address range that is to be used for pods on that node:
+10.200.{dpnode#}.0/24 for node0, node1, node2.
+
+- On node0, node1 and node2: install necessary OS packages
+```
+apt-get -y install socat conntrack ipset
+```
+- On node0, node1 and node2: Download K8s applications
+```
+wget -q --show-progress --https-only --timestamping \
+  https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.17.0/crictl-v1.17.0-linux-amd64.tar.gz \
+  https://github.com/opencontainers/runc/releases/download/v1.0.0-rc10/runc.amd64 \
+  https://github.com/containernetworking/plugins/releases/download/v0.8.5/cni-plugins-linux-amd64-v0.8.5.tgz \
+  https://github.com/containerd/containerd/releases/download/v1.2.13/containerd-1.2.13.linux-amd64.tar.gz \
+  https://storage.googleapis.com/kubernetes-release/release/v1.17.2/bin/linux/amd64/kubectl \
+  https://storage.googleapis.com/kubernetes-release/release/v1.17.2/bin/linux/amd64/kube-proxy \
+  https://storage.googleapis.com/kubernetes-release/release/v1.17.2/bin/linux/amd64/kubelet
+```
+- On node0, node1 and node2: create directories for binaries and config files
+```
+  mkdir -p \
+  /etc/cni/net.d \
+  /opt/cni/bin \
+  /var/lib/kubelet \
+  /var/lib/kube-proxy \
+  /var/lib/kubernetes \
+  /var/run/kubernetes
+```
+- On node0, node1 and node2: install binaries
+```
+  mkdir containerd
+  tar -xvf crictl-v1.17.0-linux-amd64.tar.gz
+  tar -xvf containerd-1.2.13.linux-amd64.tar.gz -C containerd
+  sudo tar -xvf cni-plugins-linux-amd64-v0.8.5.tgz -C /opt/cni/bin/
+  sudo mv runc.amd64 runc
+  chmod +x crictl kubectl kube-proxy kubelet runc 
+  sudo mv crictl kubectl kube-proxy kubelet runc /usr/local/bin/
+  sudo mv containerd/bin/* /bin/
+```
+- On node0, node1 and node2: configure networking - adjust POD_CIDR depending on node
+```
+POD_CIDR=10.200.0.0/24 # or 10.200.1.0 or 10.100.2.0 if on node1 and node2
+cat <<EOF | sudo tee /etc/cni/net.d/10-bridge.conf
+{
+    "cniVersion": "0.3.1",
+    "name": "bridge",
+    "type": "bridge",
+    "bridge": "cnio0",
+    "isGateway": true,
+    "ipMasq": true,
+    "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [{"subnet": "${POD_CIDR}"}]
+        ],
+        "routes": [{"dst": "0.0.0.0/0"}]
+    }
+}
+EOF
+
+cat <<EOF | sudo tee /etc/cni/net.d/99-loopback.conf
+{
+    "cniVersion": "0.3.1",
+    "name": "lo",
+    "type": "loopback"
+}
+EOF
+```
+- On node0, node1 and node2: configure conatinerd and systemctl startup file
+```
+mkdir -p /etc/containerd/
+
+cat << EOF | sudo tee /etc/containerd/config.toml
+[plugins]
+  [plugins.cri.containerd]
+    snapshotter = "overlayfs"
+    [plugins.cri.containerd.default_runtime]
+      runtime_type = "io.containerd.runtime.v1.linux"
+      runtime_engine = "/usr/local/bin/runc"
+      runtime_root = ""
+EOF
+
+cat <<EOF | sudo tee /etc/systemd/system/containerd.service
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target
+
+[Service]
+ExecStartPre=/sbin/modprobe overlay
+ExecStart=/bin/containerd
+Restart=always
+RestartSec=5
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-999
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+#### On node0, node1 and node2: configure the kubelet
+- On the host: generate the certs, they are different for each node
+```
+for instance in node0 node1 node2; do
+cat > ${instance}-csr.json <<EOF
+{
+  "CN": "system:node:${instance}",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "US",
+      "L": "Mountain View",
+      "O": "system:nodes",
+      "OU": "Lab",
+      "ST": "California"
+    }
+  ]
+}
+EOF
+done
+
+INTERNAL_IP=192.168.100.200 # .201,.202 for node0, node1 and node2
+instance=node0              # node1, node2 
+
+cfssl gencert \
+  -ca=ca.pem \
+  -ca-key=ca-key.pem \
+  -config=ca-config.json \
+  -hostname=${instance},${EXTERNAL_IP},${INTERNAL_IP} \
+  -profile=kubernetes \
+  ${instance}-csr.json | cfssljson -bare ${instance}
+```
+- On the host: KUBERNETES_PUBLIC_ADDRESS is the API server to contact (cp0 here at least initially)
+```
+KUBERNETES_PUBLIC_ADDRESS=192.168.100.100
+for instance in node0 node1 node2; do
+  kubectl config set-cluster kubernetes-the-hard-way \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://${KUBERNETES_PUBLIC_ADDRESS}:6443 \
+    --kubeconfig=${instance}.kubeconfig
+
+  kubectl config set-credentials system:node:${instance} \
+    --client-certificate=${instance}.pem \
+    --client-key=${instance}-key.pem \
+    --embed-certs=true \
+    --kubeconfig=${instance}.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=kubernetes-the-hard-way \
+    --user=system:node:${instance} \
+    --kubeconfig=${instance}.kubeconfig
+
+  kubectl config use-context default --kubeconfig=${instance}.kubeconfig
+done
+```
+- On the host: copy to node0, node1 and node2
+```
+scp node0*.pem node0.kubeconfig ca.pem node0: # same for node1 and node2
+```
+- On node0, node1 and node2: move config files
+```
+mv ${HOSTNAME}-key.pem ${HOSTNAME}.pem /var/lib/kubelet/
+mv ${HOSTNAME}.kubeconfig /var/lib/kubelet/kubeconfig
+mv ca.pem /var/lib/kubernetes/
+```
+-  On node0, node1 and node2: generate YAML config file
+```
+cat <<EOF | sudo tee /var/lib/kubelet/kubelet-config.yaml
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: "/var/lib/kubernetes/ca.pem"
+authorization:
+  mode: Webhook
+clusterDomain: "cluster.local"
+clusterDNS:
+  - "10.32.0.10"
+podCIDR: "${POD_CIDR}"
+resolvConf: "/run/systemd/resolve/resolv.conf"
+runtimeRequestTimeout: "15m"
+tlsCertFile: "/var/lib/kubelet/${HOSTNAME}.pem"
+tlsPrivateKeyFile: "/var/lib/kubelet/${HOSTNAME}-key.pem"
+EOF
+```
+- On node0, node1 and node2: generate systemctl startup file
+```
+cat <<EOF | sudo tee /etc/systemd/system/kubelet.service
+[Unit]
+Description=Kubernetes Kubelet
+Documentation=https://github.com/kubernetes/kubernetes
+After=containerd.service
+Requires=containerd.service
+
+[Service]
+ExecStart=/usr/local/bin/kubelet \\
+  --config=/var/lib/kubelet/kubelet-config.yaml \\
+  --container-runtime=remote \\
+  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \\
+  --image-pull-progress-deadline=2m \\
+  --kubeconfig=/var/lib/kubelet/kubeconfig \\
+  --network-plugin=cni \\
+  --register-node=true \\
+  --v=2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+
+
+#### On node0, node1 and node2: configure the kube-proxy
+
+- On the Host: generate certs
+```
+cat > kube-proxy-csr.json <<EOF
+{
+  "CN": "system:kube-proxy",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "US",
+      "L": "Mountain View",
+      "O": "system:node-proxier",
+      "OU": "Lab",
+      "ST": "California"
+    }
+  ]
+}
+EOF
+
+cfssl gencert \
+  -ca=ca.pem \
+  -ca-key=ca-key.pem \
+  -config=ca-config.json \
+  -profile=kubernetes \
+  kube-proxy-csr.json | cfssljson -bare kube-proxy
+```
+- On the Host: generate kubeconfig file
+```
+KUBERNETES_PUBLIC_ADDRESS=192.168.100.100
+kubectl config set-cluster kubernetes-the-hard-way \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://${KUBERNETES_PUBLIC_ADDRESS}:6443 \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config set-credentials system:kube-proxy \
+    --client-certificate=kube-proxy.pem \
+    --client-key=kube-proxy-key.pem \
+    --embed-certs=true \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=kubernetes-the-hard-way \
+    --user=system:kube-proxy \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig
+```
+- On the Host: copy file to node0, node1 and node2
+```
+scp kube-proxy.kubeconfig node0:
+```
+- On node0, node1and node2: move configfile into required directory 
+```
+mv kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig 
+```
+- On node0, node1and node2: the YAML config file
+```
+cat <<EOF | sudo tee /var/lib/kube-proxy/kube-proxy-config.yaml
+kind: KubeProxyConfiguration
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+clientConnection:
+  kubeconfig: "/var/lib/kube-proxy/kubeconfig"
+mode: "iptables"
+clusterCIDR: "10.200.0.0/16"
+EOF
+```
+- On node0, node1and node2: generate the systemctl startup file
+```
+cat <<EOF | sudo tee /etc/systemd/system/kube-proxy.service
+[Unit]
+Description=Kubernetes Kube Proxy
+Documentation=https://github.com/kubernetes/kubernetes
+
+[Service]
+ExecStart=/usr/local/bin/kube-proxy \\
+  --config=/var/lib/kube-proxy/kube-proxy-config.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+- On node0, node1and node2: starts all apllications
+```
+systemctl daemon-reload
+systemctl enable containerd kubelet kube-proxy
+systemctl start containerd kubelet kube-proxy
+```
+- On cp0: see if nodes are registered
+```
+kubectl get nodes
+```
+- should give:
+```
+NAME    STATUS   ROLES    AGE    VERSION
+node0   Ready    <none>   6d2h   v1.17.2
+node1   Ready    <none>   5d7h   v1.17.2
+node2   Ready    <none>   5d7h   v1.17.2
+```
+- On cp0, cp1 and cp2: Th econtrol plane needs to be able to resolve the node names to an IP address. Add IPs to /etc/hosts on cp0, cp1 and cp3
+```
+192.168.100.200 node0
+192.168.100.201 node1
+192.168.100.202 node2
+```
+
+
+## Step 5: Setup kubectl on the host
+kubectl on the host needs to be able to reach the admin server and present a valid certificate.
+- On the host: generate a kubeconfig file
+```
+KUBERNETES_PUBLIC_ADDRESS=192.168.100.100
+
+kubectl config set-cluster kubernetes-the-hard-way \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://${KUBERNETES_PUBLIC_ADDRESS}:6443
+
+  kubectl config set-credentials admin \
+    --client-certificate=admin.pem \
+    --client-key=admin-key.pem
+
+  kubectl config set-context kubernetes-the-hard-way \
+    --cluster=kubernetes-the-hard-way \
+    --user=admin
+
+  kubectl config use-context kubernetes-the-hard-way
+```
+- On the Host: Test
+```
+kubectl get nodes
+```
+- On the Host: Run a small application, pulled from dockerhub
+```
+cat <<EOF > baseapachedeployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: baseapache
+  labels:
+    app: baseapache
+spec:
+  replicas: 1
+  strategy: 
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: baseapache
+  template:
+    metadata:
+      labels:
+        app: baseapache
+    spec:
+      containers:
+       - name: baseapache
+         image: wkandek/baseapache:latest
+         imagePullPolicy: Always
+      terminationGracePeriodSeconds: 0 
+EOF
+
+
+kubectl -f baseapachedeployment.yaml
+kubectl get pods
+kubectl exec -ti <podid> /bin/bash
+```
+
+
+
+
 
 ## Standby for next steps...
