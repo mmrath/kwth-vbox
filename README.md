@@ -1052,9 +1052,91 @@ kubectl -f baseapachedeployment.yaml
 kubectl get pods
 kubectl exec -ti <podid> /bin/bash
 ```
+The cluster is now able to run pods. wkandek/baseapache is a docker image that serves a simple HTML page. At this point the HTML page can  be accessed only on the node that it is running on, as we are still missing the network setup that maps pods to outside addresses.
+
+Test: Access the Pods IP address with 'kubectl get pods -o wide', find the node that it running on, ssh to the node and try curl to the address of the pod 10.200.x.y. A simple HTML page should be returned.
 
 
 
+## Step 6: Networking Installation
+
+K8s by itself does not come with the necessary networking capabilities to communicate to other nodes or map services to outside addresses. Instead it leaves that functionality to a Container Network Interface (CNI) implementation.
+
+This tutorial uses flannel is a simple implementation of a CNI.
+
+- install flannel - on the host: download the YAML file, edit 2 parameters
+  - replace vxlan -> host_gw
+  - add --iface-regex=192\.168\.100\. in the command definition
+```
+wget -q --show-progress --https-only --timestamping \
+	"https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml"
+vxlan -> host-gw
+command:
+  - /opt/bin/flanneld
+  args:
+  - --ip-masq
+  - --kube-subnet-mgr
+  - --iface-regex=192\.168\.100\.
+```
+- On the host: kubectl apply -f kube-flannel.yml
+- On the host: kubectl -n kube-system get pods - to see if the flannel pods are running
+
+flannel by itself will still not get a mapping to an external IP address, in our case the 192.168.100.x space. For that we need to install additional network software. MetalLB is a load balancer that works with k8s to provide the necessary mapping from internal service addresses to external IP addresses.
+
+-  On the host: download YAML for MetalLB
+```
+wget https://raw.githubusercontent.com/google/metallb/v0.8.3/manifests/metallb.yaml
+```
+- On the host:  create a configmap to define the range of IP addresses that MetalLB can map
+```
+cat <<EOF > metalLBconfigmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: metallb-system
+  name: config
+data:
+  config: |
+    address-pools:
+    - name: default
+      protocol: layer2
+      addresses:
+      - 192.168.100.240-192.168.100.250
+EOF
+kubectl apply -f metalLBconfigmap.yaml
+kubectl apply -f metallb.yaml
+```
+Now a pod can be mapped to an external IP through a service definition of type: LoadBalancer
+```
+cat <<EOF > baseapacheservice.yaml
+kind: Service
+apiVersion: v1
+metadata:
+  name: baseapache
+spec:
+  selector:
+    app: baseapache
+  type: LoadBalancer
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+EOF
+
+kubectl apply -f baseapacheservice.yaml
+kubectl get service
+curl http://192.168.100.24X
+```
+
+To have k8s DNS integration we need to install a DNS service, for example coredns.
+```
+wget https://storage.googleapis.com/kubernetes-the-hard-way/coredns.yaml
+```
+- edit the coredns YAML file and add forward 8.8.8.8 in the .53 stanza just under the prometheus line to provide external DNS resolution
+```
+kubectl apply -f coredns.yaml
+```
+Now an nslookup on a newly started pod will work. 
 
 
-## Standby for next steps...
+## Standby for more...
