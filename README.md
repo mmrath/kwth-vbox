@@ -871,6 +871,7 @@ ExecStart=/usr/local/bin/kubelet \\
   --network-plugin=cni \\
   --register-node=true \\
   --node-ip=192.168.100.200 \\
+  --resolv-conf=/run/systemd/resolve/resolv.conf \\
   --v=2
 Restart=on-failure
 RestartSec=5
@@ -942,7 +943,7 @@ scp kube-proxy.kubeconfig node0:
 ```
 mv kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig 
 ```
-- On node0, node1and node2: the YAML config file
+- On node0, node1 and node2: the YAML config file
 ```
 cat <<EOF | sudo tee /var/lib/kube-proxy/kube-proxy-config.yaml
 kind: KubeProxyConfiguration
@@ -953,7 +954,7 @@ mode: "iptables"
 clusterCIDR: "10.200.0.0/16"
 EOF
 ```
-- On node0, node1and node2: generate the systemctl startup file
+- On node0, node1 and node2: generate the systemctl startup file
 ```
 cat <<EOF | sudo tee /etc/systemd/system/kube-proxy.service
 [Unit]
@@ -970,7 +971,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 ```
-- On node0, node1and node2: starts all apllications
+- On node0, node1 and node2: starts all apllications
 ```
 systemctl daemon-reload
 systemctl enable containerd kubelet kube-proxy
