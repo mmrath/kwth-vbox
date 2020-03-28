@@ -723,7 +723,7 @@ cat <<EOF | sudo tee /etc/cni/net.d/99-loopback.conf
 }
 EOF
 ```
-- On node0, node1 and node2: configure conatinerd and systemctl startup file
+- On node0, node1 and node2: configure containerd and systemctl startup file
 ```
 mkdir -p /etc/containerd/
 
@@ -852,7 +852,7 @@ tlsCertFile: "/var/lib/kubelet/${HOSTNAME}.pem"
 tlsPrivateKeyFile: "/var/lib/kubelet/${HOSTNAME}-key.pem"
 EOF
 ```
-- On node0, node1 and node2: generate systemctl startup file
+- On node0, node1 and node2: generate systemctl startup file - node-ip changes!
 ```
 cat <<EOF | sudo tee /etc/systemd/system/kubelet.service
 [Unit]
@@ -870,6 +870,7 @@ ExecStart=/usr/local/bin/kubelet \\
   --kubeconfig=/var/lib/kubelet/kubeconfig \\
   --network-plugin=cni \\
   --register-node=true \\
+  --node-ip=192.168.100.200 \\
   --v=2
 Restart=on-failure
 RestartSec=5
