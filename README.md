@@ -1081,7 +1081,7 @@ command:
 - On the host: kubectl apply -f kube-flannel.yml
 - On the host: kubectl -n kube-system get pods - to see if the flannel pods are running
 
-flannel by itself will still not get a mapping to an external IP address, in our case the 192.168.100.x space. For that we need to install additional network software. MetalLB is a load balancer that works with k8s to provide the necessary mapping from internal service addresses to external IP addresses.
+flannel alone will still not get a mapping to an external IP address, in our case the 192.168.100.x space. For that we need to install additional network software. MetalLB is a load balancer that works with k8s to provide the necessary mapping from internal service addresses to external IP addresses.
 
 -  On the host: download YAML for MetalLB
 ```
@@ -1137,6 +1137,109 @@ wget https://storage.googleapis.com/kubernetes-the-hard-way/coredns.yaml
 kubectl apply -f coredns.yaml
 ```
 Now an nslookup on a newly started pod will work. 
+
+## Step 7: API Loadbalancer
+
+The API server runs on cp0, cp1 and cp2 but it is only accessed on cp0  through IP address ```192.168.100.100``` for example by the kubelet on the nodes and kubectl on the host. There is no k8s native way to loadbalance API requests, but an external loadbalancer works fine.
+
+We will install an addtional VM with ```haproxy``` to implement the load balancer.
+```
+                           +-----------------+
+                           |      API LB     |
+                           | 192.168.100.50  |
+                           +-----------------+  
+
+    +-----------------+    +-----------------+    +-----------------+
+    |       cp0       |    |       cp1       |    |       cp2       |
+    | 192.168.100.100 |    | 192.168.100.101 |    | 192.168.100.102 |
+    +-----------------+    +-----------------+    +-----------------+
+```
+
+Add the following lines to the ```Vagrantfile``` to define the additional VM:
+
+```
+  config.vm.define "loadbalancer" do |loadbalancer|
+    loadbalancer.vm.box = 'ubuntu/bionic64'
+    loadbalancer.vm.hostname = "loadbalancer"
+    loadbalancer.vm.network :private_network, ip: "192.168.100.50"
+    loadbalancer.vm.provision "shell", inline: $vmscript
+  end
+```
+
+and run 
+
+```
+vagrant up loadbalancer
+```
+
+to provision the VM.
+
+Then as root install haproxy on the VM:
+
+```
+apt-get update
+apt-get upgrade
+apt-get haproxy
+```
+
+and edit the haproxy.cfg file in /etc/haproxy:
+
+```
+defaults
+        log     global
+        mode    tcp
+        option  tcplog
+        option  dontlognull
+        timeout connect 5000
+        timeout client  50000
+        timeout server  50000
+        errorfile 400 /etc/haproxy/errors/400.http
+        errorfile 403 /etc/haproxy/errors/403.http
+        errorfile 408 /etc/haproxy/errors/408.http
+        errorfile 500 /etc/haproxy/errors/500.http
+        errorfile 502 /etc/haproxy/errors/502.http
+        errorfile 503 /etc/haproxy/errors/503.http
+        errorfile 504 /etc/haproxy/errors/504.http
+
+frontend k8sapi
+        bind 192.168.100.50:6443
+        default_backend k8sapiservers
+
+backend k8sapiservers
+        balance roundrobin
+        mode tcp
+        server cp1 192.168.100.100:6443 check
+        server cp2 192.168.100.101:6443 check
+        server cp3 192.168.100.102:6443 check
+```
+
+and restart the haproxy service: ```systemctl restart haproxy```
+
+When we access the API server through https://192.168.100.50:6433 we get a certificate warning as the certificate does not include that IP as a valid target. We need to regenerate the certificate on the host and copy to cp0, cp1 and cp2 and restart the API servers.
+
+```
+cfssl gencert \
+  -ca=ca.pem \
+  -ca-key=ca-key.pem \
+  -config=ca-config.json \
+  -hostname=10.32.0.1,192.168.100.50,192.168.100.100,192.168.100.101,192.168.100.102,127.0.0.1,${KUBERNETES_HOSTNAMES} \
+  -profile=kubernetes \
+  kubernetes-csr.json | cfssljson -bare kubernetes
+
+scp kubernetes.pem kubernetes-key.pem cp0:/var/lib/kubernetes/
+scp kubernetes.pem kubernetes-key.pem cp1:/var/lib/kubernetes/
+scp kubernetes.pem kubernetes-key.pem cp2:/var/lib/kubernetes/
+
+ssh cp0 'systemctl restart kube-apiserver'
+ssh cp1 'systemctl restart kube-apiserver'
+ssh cp2 'systemctl restart kube-apiserver'
+```
+
+Test via firefox on the host to see if everything works. To get rid of the firefox warnings on the self signed CA, import the CA into firefox via preferences, secuirty, view certificates, import.
+
+Obs: This type of test will require a way to run firefox on the host but have its window displayed on the workstation. XWindows works, but other solutions such as VNC work as well. 
+
+Finally the kubelets need to be configured to access the new IP address. Generate a new kubeconfig file with the external address set to 192.168.100.50, copy to node0, node1, and node2 and restart the service. 
 
 
 ## Standby for more...
